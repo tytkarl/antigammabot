@@ -17,7 +17,17 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 
-# ----------------------------- PPTX CLEANER -----------------------------
+# ---------------- ENV VARIABLES ----------------
+
+BOT_ID = os.getenv("BOT_ID")       # не обязателен, но пусть будет
+BOT_TOKEN = os.getenv("BOT_TOKEN") # основной токен
+
+if not BOT_TOKEN:
+    print("❌ BOT_TOKEN не найден! Установи переменную окружения.")
+    exit(1)
+
+
+# ---------------- PPTX CLEANER ----------------
 
 def clean_pptx(input_path, output_path):
     ns = {
@@ -53,51 +63,52 @@ def clean_pptx(input_path, output_path):
                 root_rels = ET.fromstring(rel_data)
 
                 for rel in list(root_rels):
-                    if not rel.tag.endswith('Relationship'):
-                        continue
-                    rid = rel.get('Id')
-                    target = rel.get('Target', '')
-                    rType = rel.get('Type', '')
+                    if rel.tag.endswith("Relationship"):
+                        rid = rel.get("Id")
+                        target = rel.get("Target", "")
+                        rType = rel.get("Type", "")
 
-                    if 'image' in rType:
-                        image_rels[rid] = target
+                        if "image" in rType:
+                            image_rels[rid] = target
 
-                    if 'hyperlink' in rType and 'gamma.app' in target:
-                        hlink_ids.append(rid)
-                        root_rels.remove(rel)
-                        links_removed += 1
+                        if "hyperlink" in rType and "gamma.app" in target:
+                            hlink_ids.append(rid)
+                            root_rels.remove(rel)
+                            links_removed += 1
 
-                new_rels_xml = ET.tostring(root_rels, encoding='utf-8', xml_declaration=True)
-                modified_xml[rels_path] = new_rels_xml
+                modified_xml[rels_path] = ET.tostring(root_rels, encoding="utf-8", xml_declaration=True)
             else:
                 root_rels = None
 
             xml_data = zin.read(xml_path)
             root = ET.fromstring(xml_data)
-            spTree = root.find('.//p:spTree', ns)
+            spTree = root.find(".//p:spTree", ns)
             if spTree is None:
                 return
 
-            keywords = ["gamma", "button", "watermark"]
+            # Удаляем текстовые блоки Gamma
+            words = ["gamma", "button", "watermark"]
             to_remove = []
 
-            for sp in spTree.findall('p:sp', ns):
-                texts = [t.text for t in sp.findall('.//a:t', ns) if t.text]
+            for sp in spTree.findall("p:sp", ns):
+                texts = [t.text for t in sp.findall(".//a:t", ns) if t.text]
                 combined = (" ".join(texts)).lower()
-                if any(k in combined for k in keywords):
+                if any(w in combined for w in words):
                     to_remove.append(sp)
 
             for sp in to_remove:
                 spTree.remove(sp)
 
+            # Удаляем images watermark
             pic_remove = []
             pic_ids = []
-            for pic in spTree.findall('p:pic', ns):
-                blip = pic.find('.//a:blip', ns)
+
+            for pic in spTree.findall("p:pic", ns):
+                blip = pic.find(".//a:blip", ns)
                 if blip is None:
                     continue
 
-                embed = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
+                embed = blip.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed")
                 if not embed or embed not in image_rels:
                     continue
 
@@ -119,8 +130,7 @@ def clean_pptx(input_path, output_path):
                 except:
                     continue
 
-                size = (img.width, img.height)
-                if size in watermark_sizes:
+                if (img.width, img.height) in watermark_sizes:
                     pic_remove.append(pic)
                     pic_ids.append(embed)
                     removed_images.add(target_file)
@@ -131,19 +141,12 @@ def clean_pptx(input_path, output_path):
 
             if root_rels is not None:
                 for rel in list(root_rels):
-                    if rel.get('Id') in pic_ids:
+                    if rel.get("Id") in pic_ids:
                         root_rels.remove(rel)
 
-                new_rels_xml = ET.tostring(root_rels, encoding='utf-8', xml_declaration=True)
-                modified_xml[rels_path] = new_rels_xml
+                modified_xml[rels_path] = ET.tostring(root_rels, encoding="utf-8", xml_declaration=True)
 
-            for elem in root.iter():
-                for child in list(elem):
-                    if child.tag.endswith('hlinkClick'):
-                        if child.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id') in hlink_ids:
-                            elem.remove(child)
-
-            new_xml = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+            new_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
             modified_xml[xml_path] = new_xml
 
         for slide in slides:
@@ -162,18 +165,16 @@ def clean_pptx(input_path, output_path):
                 else:
                     zout.writestr(item, zin.read(item))
 
-    print(f"PPTX очищено — удалено {images_removed} watermark-картинок и {links_removed} ссылок.")
+    print(f"PPTX: удалено {images_removed} watermark-картинок и {links_removed} ссылок.")
 
 
-# ----------------------------- PDF CLEANER -----------------------------
+# ---------------- PDF CLEANER ----------------
 
 def clean_pdf(input_path, output_path):
     doc = fitz.open(input_path)
 
     for page in doc:
-        W = page.rect.width
-        H = page.rect.height
-
+        W, H = page.rect.width, page.rect.height
         rect = fitz.Rect(W - 2000, H - 37, W, H)
 
         sample_x = max(0, rect.x0 - 10)
@@ -181,8 +182,8 @@ def clean_pdf(input_path, output_path):
 
         try:
             pix = page.get_pixmap(clip=fitz.Rect(sample_x, sample_y, sample_x + 1, sample_y + 1))
-            bg = tuple(pix.samples[:3])
-            color = (bg[0] / 255, bg[1] / 255, bg[2] / 255)
+            r, g, b = pix.samples[:3]
+            color = (r / 255, g / 255, b / 255)
         except:
             color = (1, 1, 1)
 
@@ -192,22 +193,15 @@ def clean_pdf(input_path, output_path):
     doc.close()
 
 
-# ----------------------------- BOT LOGIC -----------------------------
-
-TOKEN = ""   #НУ ТИПА ЭТА ТАКЕН
-
+# ---------------- BOT HANDLERS ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Отправь PDF или PPTX — я очищу watermark Gamma."
-    )
+    await update.message.reply_text("Отправь PDF или PPTX — я уберу watermark Gamma.")
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     fname = doc.file_name.lower()
-
-    file = await doc.get_file()
 
     os.makedirs("tmp", exist_ok=True)
     os.makedirs("out", exist_ok=True)
@@ -215,6 +209,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     in_path = f"tmp/{fname}"
     out_path = f"out/cleaned_{fname}"
 
+    file = await doc.get_file()
     await file.download_to_drive(in_path)
 
     if fname.endswith(".pptx"):
@@ -233,7 +228,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     req = HTTPXRequest(connect_timeout=20, read_timeout=200)
-    app = ApplicationBuilder().token(TOKEN).request(req).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
