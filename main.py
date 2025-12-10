@@ -3,6 +3,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 import io
 import os
+from asyncio import sleep
 from PIL import Image
 import fitz
 
@@ -19,26 +20,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-
-# ----------------------------- ACCESS CONTROL -----------------------------
-
-ALLOWED_USERS = {7802641445, 0}
-
-def is_allowed(user_id: int) -> bool:
-    return user_id in ALLOWED_USERS
-
-
-# ----------------------------- ENV VARIABLES -----------------------------
-
-BOT_ID = os.getenv("BOT_ID")       # не обязательно, но можно использовать
-BOT_TOKEN = os.getenv("BOT_TOKEN") # основной токен
-
-if not BOT_TOKEN:
-    print("❌ BOT_TOKEN не найден в .env")
-    exit(1)
-
-
-# ----------------------------- PPTX CLEANER -----------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN") #by Slava Bebrou
 
 def clean_pptx(input_path, output_path):
     ns = {
@@ -49,8 +31,7 @@ def clean_pptx(input_path, output_path):
 
     watermark_sizes = [(921, 220), (1842, 440)]
     removed_images = set()
-    images_removed = 0
-    links_removed = 0
+
     modified_xml = {}
 
     with zipfile.ZipFile(input_path, 'r') as zin:
@@ -61,14 +42,13 @@ def clean_pptx(input_path, output_path):
         masters = [f for f in filelist if f.startswith("ppt/slideMasters/slideMaster") and f.endswith(".xml")]
 
         def process_file(xml_path, base_dir):
-            nonlocal images_removed, links_removed
             filename = xml_path.split('/')[-1]
             rels_dir  = base_dir + "/_rels/"
             rels_path = rels_dir + filename + ".rels"
 
             image_rels = {}
-            hlink_ids = []
 
+            # читаем rels
             if rels_path in filelist:
                 root_rels = ET.fromstring(zin.read(rels_path))
 
@@ -83,38 +63,30 @@ def clean_pptx(input_path, output_path):
                     if 'image' in rType:
                         image_rels[rid] = tgt
 
-                    if 'hyperlink' in rType and 'gamma.app' in tgt:
-                        hlink_ids.append(rid)
-                        root_rels.remove(rel)
-                        links_removed += 1
-
                 modified_xml[rels_path] = ET.tostring(root_rels, encoding='utf-8', xml_declaration=True)
             else:
                 root_rels = None
 
+            # читаем xml
             root = ET.fromstring(zin.read(xml_path))
             spTree = root.find('.//p:spTree', ns)
             if spTree is None:
                 return
-
-            # remove text objects
-            keywords = ["gamma", "button", "watermark"]
-            for sp in list(spTree.findall('p:sp', ns)):
-                texts = [t.text for t in sp.findall('.//a:t', ns) if t.text]
-                if any(k in " ".join(texts).lower() for k in keywords):
-                    spTree.remove(sp)
-
-            # remove watermark images
+            
             pic_ids = []
+
+            # поиск картинок
             for pic in list(spTree.findall('p:pic', ns)):
                 blip = pic.find('.//a:blip', ns)
                 if blip is None:
                     continue
+
                 embed = blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
                 if embed not in image_rels:
                     continue
 
                 target_file = image_rels[embed]
+
                 if target_file.startswith("../"):
                     target_file = target_file[3:]
                 if not target_file.startswith("ppt/"):
@@ -128,27 +100,24 @@ def clean_pptx(input_path, output_path):
                 except:
                     continue
 
+                # watermark gamma
                 if (img.width, img.height) in watermark_sizes:
                     spTree.remove(pic)
                     pic_ids.append(embed)
                     removed_images.add(target_file)
-                    images_removed += 1
 
+            # чистим rels
             if root_rels is not None:
                 for rel in list(root_rels):
                     if rel.get('Id') in pic_ids:
                         root_rels.remove(rel)
+
                 modified_xml[rels_path] = ET.tostring(root_rels, encoding='utf-8', xml_declaration=True)
 
-            # remove hlinkClick
-            for elem in root.iter():
-                for child in list(elem):
-                    if child.tag.endswith('hlinkClick'):
-                        if child.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id') in hlink_ids:
-                            elem.remove(child)
-
+            # сохраняем изменённый xml
             modified_xml[xml_path] = ET.tostring(root, encoding='utf-8', xml_declaration=True)
 
+        # обрабатываем все файлы
         for slide in slides:
             process_file(slide, "ppt/slides")
         for layout in layouts:
@@ -156,56 +125,70 @@ def clean_pptx(input_path, output_path):
         for master in masters:
             process_file(master, "ppt/slideMasters")
 
+        # создаём новый pptx
         with zipfile.ZipFile(output_path, 'w') as zout:
             for item in filelist:
                 if item in removed_images:
                     continue
                 zout.writestr(item, modified_xml.get(item, zin.read(item)))
 
-    print(f"PPTX очищено — удалено {images_removed} watermark-картинок и {links_removed} ссылок.")
-
-
-# ----------------------------- PDF CLEANER -----------------------------
-
+# PDF cleaner
 def clean_pdf(input_path, output_path):
+    import fitz
     doc = fitz.open(input_path)
+
+    SAMPLE_OFFSETS = [
+        (0.5, 0.5),   # центр
+        (0.1, 0.5),   # слева по центру
+        (0.9, 0.5),   # справа по центру
+        (0.5, 0.2),   # сверху по центру
+        (0.5, 0.8),   # снизу по центру
+    ]
 
     for page in doc:
         W, H = page.rect.width, page.rect.height
+
+        # прямоугольник водяного знака
         rect = fitz.Rect(W - 2000, H - 37, W, H)
 
-        try:
-            pix = page.get_pixmap(clip=fitz.Rect(rect.x0 - 10, rect.y0 + rect.height/2,
-                                                 rect.x0 - 9, rect.y0 + rect.height/2 + 1))
-            bg = tuple(pix.samples[:3])
-            color = (bg[0]/255, bg[1]/255, bg[2]/255)
-        except:
-            color = (1, 1, 1)
+        colors = []
 
-        page.draw_rect(rect, fill=color, color=color, overlay=True)
+        for ox, oy in SAMPLE_OFFSETS:
+            sx = rect.x0 + rect.width * ox
+            sy = rect.y0 + rect.height * oy
+
+            # маленькая выборка 1×1
+            clip_rect = fitz.Rect(sx, sy, sx + 1, sy + 1)
+
+            try:
+                pix = page.get_pixmap(clip=clip_rect)
+                r, g, b = pix.samples[:3]
+                colors.append((r, g, b))
+            except:
+                pass
+
+        # если не удалось собрать ни одной точки
+        if not colors:
+            avg_color = (1, 1, 1)
+        else:
+            # усреднение RGB
+            r = sum(c[0] for c in colors) / (255 * len(colors))
+            g = sum(c[1] for c in colors) / (255 * len(colors))
+            b = sum(c[2] for c in colors) / (255 * len(colors))
+            avg_color = (r, g, b)
+
+        # закрашиваем область
+        page.draw_rect(rect, fill=avg_color, color=avg_color, overlay=True)
 
     doc.save(output_path)
     doc.close()
 
 
-# ----------------------------- BOT LOGIC -----------------------------
-
-TOKEN = BOT_TOKEN
-
-
+# ЭЭЭ ТЕЛЕГРАМ БОТ ЕЖЖЕ БЛЯ
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        await update.message.reply_text("⛔ Доступ запрещён.")
-        return
-
-    await update.message.reply_text("Отправь PDF или PPTX — я очищу watermark Gamma.")
-
+    await update.message.reply_text("Отправь PDF или PPTX — я очищу watermark Gamma.\n ФАЙЛ PPTX ДО 20 МБ, ФАЙД PDF ТОЖЕ!")
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        await update.message.reply_text("❌ У вас нет доступа к боту.")
-        return
-
     doc = update.message.document
     fname = doc.file_name.lower()
 
@@ -223,21 +206,27 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif fname.endswith(".pdf"):
         clean_pdf(in_path, out_path)
     else:
-        await update.message.reply_text("Поддерживаются только PDF и PPTX.")
+        await update.message.reply_text("Баклан тупой я же сказал только PDF ИЛИ PPTX.")
         return
 
-    await update.message.reply_document(open(out_path, "rb"), filename=f"cleaned_{fname}")
+    await update.message.reply_document(
+        document=open(out_path, "rb"),
+        filename=(fname)
+    )
+
+    await update.message.reply_text("С любовью, Слава Беброу.")
+    await sleep(0,5) 
+    await update.message.reply_text("❤️")
 
 
 def main():
     req = HTTPXRequest(connect_timeout=20, read_timeout=200)
-    app = ApplicationBuilder().token(TOKEN).request(req).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
 
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
